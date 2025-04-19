@@ -1,143 +1,274 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import axios from 'axios'; // Import axios
+import axios from 'axios';
+import { BrowserRouter as Router, Route, Routes, useNavigate, useLocation } from 'react-router-dom'; // Import react-router components
 import './App.css';
 
-// Use the environment variable defined in frontend/.env
-// Fallback for safety, though proxy should handle base URL in dev
+// --- Constants ---
 const API_BASE_URL = process.env.REACT_APP_BACKEND_API_BASE_URL || '';
 
-// Create an axios instance with default config
+// --- Token Storage ---
+// Security Warning: Storing tokens in Local Storage is vulnerable to XSS.
+// Consider more secure alternatives for production (e.g., HttpOnly cookies managed by backend-for-frontend, or in-memory with robust refresh).
+const ACCESS_TOKEN_KEY = 'spotify_access_token';
+const REFRESH_TOKEN_KEY = 'spotify_refresh_token';
+const EXPIRY_TIMESTAMP_KEY = 'spotify_expiry_timestamp';
+
+const storeTokens = (accessToken, refreshToken, expiresIn) => {
+  if (!accessToken || !expiresIn) {
+    console.error("Cannot store tokens: Access token or expires_in missing.");
+    return;
+  }
+  // Calculate expiry time (expiresIn is in seconds)
+  const expiryTimestamp = Date.now() + (parseInt(expiresIn, 10) * 1000);
+  localStorage.setItem(ACCESS_TOKEN_KEY, accessToken);
+  if (refreshToken) {
+    localStorage.setItem(REFRESH_TOKEN_KEY, refreshToken);
+  } else {
+     localStorage.removeItem(REFRESH_TOKEN_KEY); // Ensure old one is removed if not provided
+  }
+  localStorage.setItem(EXPIRY_TIMESTAMP_KEY, expiryTimestamp.toString());
+  console.log("Tokens stored. Expiry:", new Date(expiryTimestamp).toLocaleString());
+};
+
+const getAccessToken = () => localStorage.getItem(ACCESS_TOKEN_KEY);
+const getRefreshToken = () => localStorage.getItem(REFRESH_TOKEN_KEY); // Keep for potential future refresh implementation
+const getExpiryTimestamp = () => {
+  const timestamp = localStorage.getItem(EXPIRY_TIMESTAMP_KEY);
+  return timestamp ? parseInt(timestamp, 10) : null;
+};
+
+const clearTokens = () => {
+  localStorage.removeItem(ACCESS_TOKEN_KEY);
+  localStorage.removeItem(REFRESH_TOKEN_KEY);
+  localStorage.removeItem(EXPIRY_TIMESTAMP_KEY);
+  console.log("Tokens cleared.");
+};
+
+// Check if token is expired or close to expiring (e.g., within 60 seconds)
+const isTokenExpired = () => {
+    const expiry = getExpiryTimestamp();
+    if (!expiry) return true; // No expiry means we treat it as expired/invalid
+    // Check if expiry is in the past or within the next 60 seconds
+    return Date.now() >= expiry - (60 * 1000);
+};
+
+
+// --- Axios API Client Setup ---
 const apiClient = axios.create({
-  baseURL: `${API_BASE_URL}/api`, // Set base URL for all requests
-  withCredentials: true, // Crucial for sending session cookies
+  baseURL: `${API_BASE_URL}/api`,
+  // REMOVED withCredentials: true - not needed for token auth
   headers: {
     'Content-Type': 'application/json',
   },
 });
 
-function App() {
+// Axios Request Interceptor: Adds Authorization header if token exists
+apiClient.interceptors.request.use(
+  (config) => {
+    const token = getAccessToken();
+    // Add token only if it exists AND is not expired
+    if (token && !isTokenExpired()) {
+      config.headers['Authorization'] = `Bearer ${token}`;
+      console.log("Authorization header added.");
+    } else if (token && isTokenExpired()) {
+       console.warn("Token exists but is expired. Clearing tokens. Auth header not added.");
+       // NOTE: No automatic refresh implemented here. Just clear tokens.
+       // User will be logged out on the next status check or API call failure.
+       clearTokens();
+       // Optionally force logout state update here if needed immediately
+    } else {
+        console.log("No valid token found. Auth header not added.");
+    }
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// --- React Components ---
+
+// Component to handle the redirect from Spotify with tokens in hash
+function AuthCallback() {
+    const navigate = useNavigate();
+    const location = useLocation(); // Use useLocation to get the hash
+    const [authError, setAuthError] = useState(null);
+
+    useEffect(() => {
+        console.log("AuthCallback mounted. Hash:", location.hash);
+        // Use URLSearchParams on the hash part (removing the leading '#')
+        const params = new URLSearchParams(location.hash.substring(1));
+        const accessToken = params.get('access_token');
+        const refreshToken = params.get('refresh_token');
+        const expiresIn = params.get('expires_in');
+        const error = params.get('error');
+
+        if (error) {
+            console.error("Authentication error from callback:", error);
+            setAuthError(`Login failed: ${error.replace(/_/g, ' ')}. Please try again.`);
+            // Optionally clear any potentially stale tokens if error occurs
+            clearTokens();
+            // Navigate to home, potentially passing error state
+            navigate('/', { state: { authError: `Login failed: ${error.replace(/_/g, ' ')}.` } });
+        } else if (accessToken && expiresIn) {
+            console.log("Tokens received from hash.");
+            storeTokens(accessToken, refreshToken, expiresIn);
+            // Successfully stored tokens, navigate to the main app page
+            navigate('/');
+        } else {
+            console.warn("No tokens or error found in hash:", location.hash);
+            setAuthError("Authentication callback did not provide necessary tokens or error information.");
+            // Navigate home even if hash is unexpected
+             navigate('/', { state: { authError: "Invalid authentication callback received." } });
+        }
+        // Run only once on mount
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [navigate, location.hash]); // Depend on location.hash
+
+    // Display a simple loading/processing message or error
+    return (
+        <div className="App">
+             <header className="App-header">
+                 <h1>Authenticating...</h1>
+             </header>
+             <main>
+                {authError && <p className="error-message">Error: {authError}</p>}
+                <p>Please wait while we process your login.</p>
+             </main>
+        </div>
+    );
+}
+
+
+// Main Application Component
+function MainApp() {
     const [isLoggedIn, setIsLoggedIn] = useState(false);
     const [userData, setUserData] = useState(null);
     const [playlistUrl, setPlaylistUrl] = useState('');
     const [playlistName, setPlaylistName] = useState('');
-    const [isLoading, setIsLoading] = useState(true);
+    // Use state for loading indicator during auth check
+    const [isAuthLoading, setIsAuthLoading] = useState(true);
     const [isConverting, setIsConverting] = useState(false);
     const [error, setError] = useState(null);
     const [results, setResults] = useState(null);
+    const location = useLocation(); // Access location state passed from AuthCallback
 
-    // --- API Interaction Logic (Refactored with Axios) ---
+    // Check for auth errors passed via navigation state from AuthCallback
+    useEffect(() => {
+      if (location.state?.authError) {
+          setError(location.state.authError);
+          // Clear the state to avoid showing the error again on refresh
+          window.history.replaceState({}, document.title)
+      }
+    }, [location.state]);
+
+
+    // --- API Interaction Logic (Using configured Axios client) ---
     const fetchAPI = useCallback(async (endpoint, options = {}) => {
+        // Configuration now primarily happens in the axios instance and interceptors
         const config = {
-            method: options.method || 'GET', // Default to GET if not specified
-            url: endpoint, // Axios uses 'url' relative to baseURL
+            method: options.method || 'GET',
+            url: endpoint,
             data: options.body, // Axios uses 'data' for request body
             headers: {
-                ...(options.headers || {}), // Merge any additional headers
+                ...(options.headers || {}),
             },
-            // `withCredentials` and `baseURL` are handled by the apiClient instance
         };
 
         try {
+            // Use the pre-configured apiClient instance
             const response = await apiClient(config);
-
-            // Axios automatically handles JSON parsing
             return response.data;
 
         } catch (err) {
             console.error('Axios API Error:', err);
-
-            // Axios wraps errors, check for response data
             const errorData = err.response?.data;
             const status = err.response?.status;
             let errorMessage = 'An unexpected error occurred.';
 
-            if (errorData) {
+            // Specific handling for 401 Unauthorized - likely invalid/expired token
+            if (status === 401) {
+                console.warn("Received 401 Unauthorized. Clearing tokens and logging out.");
+                errorMessage = 'Your session has expired or is invalid. Please log in again.';
+                clearTokens(); // Clear invalid tokens
+                setIsLoggedIn(false); // Update state immediately
+                setUserData(null);
+            } else if (errorData) {
                  errorMessage = errorData.message || errorData.error || `Request failed with status ${status}`;
-                // Handle specific auth error
-                if (status === 401 || errorData.auth_required) {
-                    setIsLoggedIn(false);
-                    setUserData(null);
-                    errorMessage = errorData.error || 'Authentication required. Please log in.';
-                }
             } else if (err.request) {
-                // The request was made but no response was received
                 errorMessage = 'No response received from server. Check network or server status.';
             } else {
-                // Something happened in setting up the request that triggered an Error
                 errorMessage = err.message;
             }
 
-
             setError(errorMessage);
-            setIsLoading(false); // Ensure loading stops on error
+            // Ensure loading states are reset on error
+            setIsAuthLoading(false);
             setIsConverting(false);
             return null; // Indicate failure
         }
-    }, []); // No dependencies needed as apiClient is stable
+    }, []); // No dependencies needed
 
     // --- Authentication Handling ---
     const checkAuthStatus = useCallback(async () => {
-        setIsLoading(true);
-        setError(null);
-        setResults(null);
-        console.log("Checking auth status...");
+        setIsAuthLoading(true);
+        setError(null); // Clear previous errors
+        //setResults(null); // Maybe keep results?
+
+        const token = getAccessToken();
+
+        if (!token || isTokenExpired()) {
+             console.log("No token found or token expired. Clearing any remnants.");
+             if(isTokenExpired()){
+                console.log("Token expired at:", new Date(getExpiryTimestamp()).toLocaleString());
+             }
+             clearTokens();
+             setIsLoggedIn(false);
+             setUserData(null);
+             setIsAuthLoading(false);
+             return;
+        }
+
+        console.log("Token found, checking status with /api/auth/status...");
         try {
-            // Use the refactored fetchAPI
-            const data = await fetchAPI('/auth/status');
-            if (data && data.logged_in) {
+            const data = await fetchAPI('/auth/status'); // Interceptor adds token
+            if (data && data.user) { // Backend should return user data if token is valid
                 console.log("User logged in:", data.user);
                 setIsLoggedIn(true);
                 setUserData(data.user);
             } else {
-                console.log("User not logged in.");
+                 // This case might indicate a backend issue if status wasn't 401 but no user data came back
+                console.warn("/auth/status check returned OK but no user data. Assuming logged out.");
+                clearTokens(); // Treat as invalid session
                 setIsLoggedIn(false);
                 setUserData(null);
-                 // Check for errors passed in URL query params after failed callback
-                const urlParams = new URLSearchParams(window.location.search);
-                const errorParam = urlParams.get('error');
-                if (errorParam) {
-                    setError(`Login failed: ${errorParam.replace(/_/g, ' ')}. Please try again.`);
-                    // Clean the URL
-                    window.history.replaceState({}, document.title, window.location.pathname);
-                }
-                 // If data exists but logged_in is false, and no URL error, don't set generic error
-                 if (data && !data.logged_in && !errorParam) {
-                     // No specific error needed here, it's just the normal "not logged in" state
-                 } else if (!data && !errorParam) {
-                     // If fetchAPI returned null (error handled internally), don't overwrite potentially specific error
-                 }
             }
         } catch (err) {
-             // Error should be set within fetchAPI now
-             console.error("Error caught in checkAuthStatus:", err); // Keep for debugging if fetchAPI somehow throws unexpectedly
-             setIsLoggedIn(false);
-             setUserData(null);
-             // Ensure loading stops even if fetchAPI error handling failed somehow
-             if (error === null) setError('Failed to check authentication status.');
+             // Error handling (including 401 causing logout) is done within fetchAPI
+             console.error("Error during checkAuthStatus (likely handled by fetchAPI):", err);
+             // Ensure state reflects logout if fetchAPI failed and set state
+             if (isLoggedIn) { // Check current state before potentially overwriting
+                 setIsLoggedIn(false);
+                 setUserData(null);
+             }
         }
-        setIsLoading(false);
-    }, [fetchAPI, error]); // Added 'error' dependency to potentially clear old errors if needed
+        setIsAuthLoading(false);
+    }, [fetchAPI, isLoggedIn]); // Add isLoggedIn to deps? Maybe not needed as fetchAPI handles it.
+
 
     const handleLogin = () => {
-        // Redirect to the backend login endpoint
-        // This still needs the full base URL as it's a browser redirect, not an API call
+        // Redirect to the backend login endpoint - unchanged
         window.location.href = `${API_BASE_URL}/api/auth/login`;
     };
 
-    const handleLogout = useCallback(async () => {
-        setIsLoading(true);
-        setError(null);
-        setResults(null);
-        try {
-            // Use refactored fetchAPI - POST request for logout
-            await fetchAPI('/auth/logout', { method: 'POST' });
-            setIsLoggedIn(false);
-            setUserData(null);
-        } catch (err) {
-            // Error should be set by fetchAPI
-        }
-        setIsLoading(false);
-    }, [fetchAPI]); // Depends on fetchAPI
+    const handleLogout = useCallback(() => {
+        console.log("Handling logout: Clearing tokens and updating state.");
+        clearTokens();
+        setIsLoggedIn(false);
+        setUserData(null);
+        setError(null); // Clear any errors on logout
+        setResults(null); // Clear results on logout
+    }, []); // No dependencies needed
 
     // --- Conversion Handling ---
     const handleConvert = async (event) => {
@@ -147,42 +278,40 @@ function App() {
         setResults(null);
 
         try {
-             // Prepare data for Axios 'data' field
             const postData = {
                 playlist_url: playlistUrl,
-                playlist_name: playlistName || 'Converted YouTube Playlist', // Default name
+                playlist_name: playlistName || 'Converted YouTube Playlist',
             };
-
-            // Use refactored fetchAPI
+            // fetchAPI uses interceptor to add Authorization header
             const data = await fetchAPI('/convert', {
                 method: 'POST',
-                body: postData, // Pass data object to 'body' which fetchAPI maps to 'data'
+                body: postData,
             });
 
-            // Response handling remains similar
             if (data && data.success) {
                 setResults(data.data);
-                setPlaylistUrl(''); // Clear form on success
+                setPlaylistUrl('');
                 setPlaylistName('');
             } else if (data && data.error) {
                  setError(data.error);
                  if (data.data) {
                     setResults(data.data);
                  }
-            } // else: axios error handling in fetchAPI covers network/5xx errors
+            }
+            // Error handling (including 401) within fetchAPI
 
         } catch (err) {
-           // Error should be set by fetchAPI
-           console.error("Error during conversion:", err);
+           console.error("Error during conversion (likely handled by fetchAPI):", err);
         }
         setIsConverting(false);
     };
 
-    // --- Effects --- 
+    // --- Effects ---
     // Check auth status on initial load
     useEffect(() => {
         checkAuthStatus();
-    }, [checkAuthStatus]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []); // Run only once on initial mount
 
     // Simple HTML escape helper
     const escapeHTML = (str) => {
@@ -200,23 +329,40 @@ function App() {
         });
     };
 
+
     // --- Render Logic ---
+    // Show loading indicator while checking auth status initially
+    if (isAuthLoading) {
+         return (
+            <div className="App">
+                 <header className="App-header">
+                     <h1>YouTube Music to Spotify Playlist Converter</h1>
+                 </header>
+                 <main>
+                     <p>Loading authentication status...</p>
+                 </main>
+            </div>
+        );
+    }
+
     return (
         <div className="App">
             <header className="App-header">
                 <h1>YouTube Music to Spotify Playlist Converter</h1>
                 <div className="auth-section">
-                    {isLoading && <p>Loading...</p>}
-                    {!isLoading && isLoggedIn && userData && (
+                    {/* Removed isLoading check here, using isAuthLoading for initial load */}
+                    {isLoggedIn && userData && (
                         <div className="user-info">
                             <span>Logged in as <strong>{userData.display_name || userData.id}</strong></span>
-                            <button onClick={handleLogout} disabled={isLoading}>Logout</button>
+                            {/* Logout uses handleLogout directly */}
+                            <button onClick={handleLogout} disabled={isConverting}>Logout</button>
                         </div>
                     )}
-                    {!isLoading && !isLoggedIn && (
+                    {!isLoggedIn && (
                         <div className="login-prompt">
                             <p>Please log in with Spotify to convert playlists.</p>
-                            <button onClick={handleLogin} disabled={isLoading}>Login with Spotify</button>
+                            {/* Login uses handleLogin directly */}
+                            <button onClick={handleLogin} disabled={isConverting}>Login with Spotify</button>
                         </div>
                     )}
                 </div>
@@ -225,8 +371,10 @@ function App() {
             <main>
                 {error && <div className="error-message">Error: {error}</div>}
 
+                {/* Conversion form remains largely the same, depends on isLoggedIn */}
                 <form onSubmit={handleConvert} className={`conversion-form ${!isLoggedIn ? 'disabled' : ''}`}>
-                    <div className="form-group">
+                    {/* ... form inputs unchanged ... */}
+                     <div className="form-group">
                         <label htmlFor="playlist_url">YouTube Music Playlist URL:</label>
                         <input
                             type="url"
@@ -255,9 +403,11 @@ function App() {
                     </button>
                 </form>
 
+                {/* Results section remains the same */}
                 {results && (
                     <div className="results-section">
-                        <h2>Conversion Results</h2>
+                        {/* ... results display unchanged ... */}
+                         <h2>Conversion Results</h2>
                         <div className="result-summary">
                              {results.spotify_playlist_url ? (
                                  <p>Created Spotify playlist:
@@ -298,6 +448,19 @@ function App() {
                 )}
             </main>
         </div>
+    );
+}
+
+
+// App component now sets up the Router
+function App() {
+    return (
+        <Router>
+            <Routes>
+                <Route path="/auth/callback" element={<AuthCallback />} />
+                <Route path="/" element={<MainApp />} />
+            </Routes>
+        </Router>
     );
 }
 
