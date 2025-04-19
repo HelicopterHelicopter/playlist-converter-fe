@@ -4,7 +4,8 @@ import { BrowserRouter as Router, Route, Routes, useNavigate, useLocation } from
 import './App.css';
 
 // --- Constants ---
-const API_BASE_URL = process.env.REACT_APP_BACKEND_API_BASE_URL || '';
+// Vite uses import.meta.env.VITE_ for environment variables
+const API_BASE_URL = import.meta.env.VITE_BACKEND_API_BASE_URL || '';
 
 // --- Token Storage ---
 // Security Warning: Storing tokens in Local Storage is vulnerable to XSS.
