@@ -1,9 +1,19 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import axios from 'axios'; // Import axios
 import './App.css';
 
 // Use the environment variable defined in frontend/.env
 // Fallback for safety, though proxy should handle base URL in dev
 const API_BASE_URL = process.env.REACT_APP_BACKEND_API_BASE_URL || '';
+
+// Create an axios instance with default config
+const apiClient = axios.create({
+  baseURL: `${API_BASE_URL}/api`, // Set base URL for all requests
+  withCredentials: true, // Crucial for sending session cookies
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
 
 function App() {
     const [isLoggedIn, setIsLoggedIn] = useState(false);
@@ -15,62 +25,55 @@ function App() {
     const [error, setError] = useState(null);
     const [results, setResults] = useState(null);
 
-    // --- API Interaction Logic ---
+    // --- API Interaction Logic (Refactored with Axios) ---
     const fetchAPI = useCallback(async (endpoint, options = {}) => {
         const config = {
-            method: 'GET',
+            method: options.method || 'GET', // Default to GET if not specified
+            url: endpoint, // Axios uses 'url' relative to baseURL
+            data: options.body, // Axios uses 'data' for request body
             headers: {
-                'Content-Type': 'application/json',
-                // Add other headers if needed
+                ...(options.headers || {}), // Merge any additional headers
             },
-            credentials: 'include', // Crucial for sending session cookies
-            ...options,
-            headers: {
-                'Content-Type': 'application/json',
-                ...(options.headers || {}),
-            },
+            // `withCredentials` and `baseURL` are handled by the apiClient instance
         };
 
-        // Use relative path, letting the proxy handle it in development
-        // const url = `/api${endpoint}`; // Note: No base URL needed due to proxy
-        // Construct the full URL using the base URL
-        const url = `${API_BASE_URL}/api${endpoint}`;
-
         try {
-            const response = await fetch(url, config);
+            const response = await apiClient(config);
 
-            // Handle non-JSON/empty responses (like logout)
-            if (!response.headers.get("content-type")?.includes("application/json")) {
-                 if (response.ok) {
-                     return { success: true }; // Or handle based on status code if needed
-                 } else {
-                     throw new Error(`HTTP error! status: ${response.status}`);
-                 }
-            }
+            // Axios automatically handles JSON parsing
+            return response.data;
 
-            const data = await response.json();
+        } catch (err) {
+            console.error('Axios API Error:', err);
 
-            if (!response.ok) {
-                console.error('API Error Response:', data);
+            // Axios wraps errors, check for response data
+            const errorData = err.response?.data;
+            const status = err.response?.status;
+            let errorMessage = 'An unexpected error occurred.';
+
+            if (errorData) {
+                 errorMessage = errorData.message || errorData.error || `Request failed with status ${status}`;
                 // Handle specific auth error
-                if (response.status === 401 || data.auth_required) {
+                if (status === 401 || errorData.auth_required) {
                     setIsLoggedIn(false);
                     setUserData(null);
-                    throw new Error(data.error || 'Authentication required. Please log in.');
+                    errorMessage = errorData.error || 'Authentication required. Please log in.';
                 }
-                // Throw general error for other non-ok responses
-                throw new Error(data.message || data.error || `Request failed with status ${response.status}`);
+            } else if (err.request) {
+                // The request was made but no response was received
+                errorMessage = 'No response received from server. Check network or server status.';
+            } else {
+                // Something happened in setting up the request that triggered an Error
+                errorMessage = err.message;
             }
 
-            return data;
-        } catch (err) {
-            console.error('Fetch API Error:', err);
-            setError(err.message || 'An unexpected error occurred.');
+
+            setError(errorMessage);
             setIsLoading(false); // Ensure loading stops on error
             setIsConverting(false);
             return null; // Indicate failure
         }
-    }, []); // Empty dependency array: fetchAPI itself doesn't depend on component state
+    }, []); // No dependencies needed as apiClient is stable
 
     // --- Authentication Handling ---
     const checkAuthStatus = useCallback(async () => {
@@ -79,6 +82,7 @@ function App() {
         setResults(null);
         console.log("Checking auth status...");
         try {
+            // Use the refactored fetchAPI
             const data = await fetchAPI('/auth/status');
             if (data && data.logged_in) {
                 console.log("User logged in:", data.user);
@@ -96,18 +100,27 @@ function App() {
                     // Clean the URL
                     window.history.replaceState({}, document.title, window.location.pathname);
                 }
+                 // If data exists but logged_in is false, and no URL error, don't set generic error
+                 if (data && !data.logged_in && !errorParam) {
+                     // No specific error needed here, it's just the normal "not logged in" state
+                 } else if (!data && !errorParam) {
+                     // If fetchAPI returned null (error handled internally), don't overwrite potentially specific error
+                 }
             }
         } catch (err) {
-            // Error is set within fetchAPI
-             console.error("Error in checkAuthStatus catch block:", err);
+             // Error should be set within fetchAPI now
+             console.error("Error caught in checkAuthStatus:", err); // Keep for debugging if fetchAPI somehow throws unexpectedly
              setIsLoggedIn(false);
              setUserData(null);
+             // Ensure loading stops even if fetchAPI error handling failed somehow
+             if (error === null) setError('Failed to check authentication status.');
         }
         setIsLoading(false);
-    }, [fetchAPI]); // Depends on fetchAPI
+    }, [fetchAPI, error]); // Added 'error' dependency to potentially clear old errors if needed
 
     const handleLogin = () => {
         // Redirect to the backend login endpoint
+        // This still needs the full base URL as it's a browser redirect, not an API call
         window.location.href = `${API_BASE_URL}/api/auth/login`;
     };
 
@@ -116,11 +129,12 @@ function App() {
         setError(null);
         setResults(null);
         try {
-            await fetchAPI('/auth/logout');
+            // Use refactored fetchAPI - POST request for logout
+            await fetchAPI('/auth/logout', { method: 'POST' });
             setIsLoggedIn(false);
             setUserData(null);
         } catch (err) {
-            // Error set by fetchAPI
+            // Error should be set by fetchAPI
         }
         setIsLoading(false);
     }, [fetchAPI]); // Depends on fetchAPI
@@ -133,27 +147,29 @@ function App() {
         setResults(null);
 
         try {
-            const body = JSON.stringify({
+             // Prepare data for Axios 'data' field
+            const postData = {
                 playlist_url: playlistUrl,
                 playlist_name: playlistName || 'Converted YouTube Playlist', // Default name
-            });
+            };
 
+            // Use refactored fetchAPI
             const data = await fetchAPI('/convert', {
                 method: 'POST',
-                body: body,
+                body: postData, // Pass data object to 'body' which fetchAPI maps to 'data'
             });
 
+            // Response handling remains similar
             if (data && data.success) {
                 setResults(data.data);
                 setPlaylistUrl(''); // Clear form on success
                 setPlaylistName('');
             } else if (data && data.error) {
-                // Handle specific conversion errors returned successfully (e.g., 404 not found)
                  setError(data.error);
-                 if (data.data) { // Display partial data if available (like not found tracks)
+                 if (data.data) {
                     setResults(data.data);
                  }
-            } // else: fetchAPI would have thrown for network/5xx errors
+            } // else: axios error handling in fetchAPI covers network/5xx errors
 
         } catch (err) {
            // Error should be set by fetchAPI
